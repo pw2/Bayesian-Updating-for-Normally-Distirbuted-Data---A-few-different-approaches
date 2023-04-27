@@ -1,0 +1,330 @@
+---
+title: "Bayesian Updating for Normally Distributed Data - A few different approaches the normal-normal conjugate"
+author: "Patrick Ward"
+date: "1/28/2023"
+output: html_document
+---
+
+## Intro
+
+Bayesian updating provides a way of combining prior knowledge/belief with newly observed data to obtain an updated knowledge of the world (posterior). Most Bayesian updating examples begin by observing a binomial outcome and combining those observations with a beta prior. While this is useful for understanding the basic crux of Bayesian updating, not all problems that we face in the real world will be binomial in nature, thus requiring a different likelihood distribution. For example, normally distributed data can be challenging to work with because there are two parameters (a mean and standard deviation) that have their own respective variances. Two circumvent this issue, in a normal-normal conjugate, we often accept one of the parameters as being known and fixed in the population (essentially treating it as a nuisance parameter and not something we are explicitly modeling). Often, because we care about updating our knowledge about the mean (center) of an observed value the standard deviation is taken to be fixed for the population, allowing us to create an updated mean and a corresponding distribution around it.
+
+In reading about various approaches to normal-normal conjugate, I've noted three methods that can be used for Bayesian updating of a normally distributed variable in a simple way. The difference between the three approaches appears to be with the amount of information we have available to us about the observed values. These approaches are easy to use and can be applied quickly by a practitioner, with just a calculator, offering a convenient way to make observations and rationalize about the world around us.
+
+The information required for the three approaches is as follows (I'll share references to where I got each approach in the sections below):
+
+1. We have a prior value for the population mean and the sample size that this mean was taken from. What we are lacking is information about the population standard deviation. Thus, we have no information about how the variable varies.
+
+2. We have a prior mean and standard deviation for the population but we are lacking sample size information that the mean and standard deviation was derived from. Thus, we know how the variable varies but we don't know how confident we should be about the observations (a large sample means we'd be more confident while a smaller sample means we'd be less confident).
+
+3. We have all three pieces of population prior -- mean, sd, and sample size.
+
+
+## Load Data
+
+**Reference:** Data comes from [basketball-reference.com advanced shooting stats](https://www.basketball-reference.com/leagues/NBA_2023_advanced.html)
+
+We will load several seasons worth of NBA advanced shooting statistics and the stat we are interested in is Player Efficiency Rating (`per`).
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+suppressPackageStartupMessages({
+  suppressMessages({
+    suppressWarnings({
+      library(tidyverse)
+    })
+  })
+})
+
+
+theme_set(theme_light())
+
+## load nba_advanced_shooting_stats.csv
+d <- read.csv("nba_advanced_shooting_stats.csv", header = TRUE) %>%
+  select(Season, Player, Pos, Age, Tm, G, MP, PER) %>%
+  janitor::clean_names()
+
+d %>%
+  head() %>%
+  knitr::kable()
+
+```
+
+
+We have 4 seasons worth of data (really about 3.5 given that the 2022-2023 season wasn't complete when I scraped the original data).
+
+```{r}
+d %>%
+  count(season)
+```
+
+
+## Exploring Player Efficiency Rating & Minutes Played
+
+Let's focus on the Player Efficiency Rating (PER) and Minutes Played.
+
+```{r}
+par(mfrow = c(1, 2))
+hist(d$per,
+     main = "Player Efficiency Rating\n(2019 - 2023)",
+     xlab = "PER")
+boxplot(d$mp,
+        main = "Minutes Played\n(2019 - 2023)",
+        xlab = "Minutes Played")
+```
+
+
+It looks like on average players has a PER greater than 0, between 10 and 15. The minutes played is right skewed with a vast majority of the players playing a low number of minutes and a few players playing a lot of minutes.
+
+We can look at the numbers explicitly by evaluating the quantiles.
+
+```{r}
+summary(d[, c("mp", "per")])
+```
+
+
+## Setting up our priors
+
+Since the 2022 - 2023 season was not finished when I scraped this data, we will base our prior for PER on the previous 3 seasons. Additionally, we will set up our prior mean from players in the population who had over the median number of minutes played in those seasons.
+
+```{r}
+d %>%
+  filter(season != "2022-2023",
+         mp > median(mp)) %>%
+  summarize(n_players = n(),
+            avg_mp = mean(mp),
+            avg_per = mean(per),
+            sd_per = sd(per))
+```
+
+
+We can store these variables in their own elements so that they can be called later in our calculations.
+
+```{r}
+prior_mu <- 14.79
+prior_n <- 1448
+prior_df <- prior_n - 1
+```
+
+
+Recall that for our prior standard deviation we need to obtain a prior for the standard deviation around the mean (a standard error of the mean) and we also need to obtain a known population standard deviation (what I referred to as the nuisance parameter above, since we wont be directly estimating it).
+
+We will call the standard deviation for the mean PER, `prior_sd`, and the fixed standard deviation, `prior_tau`. To calculate the `prior_sd` we'll take the standard deviation across the three seasons for each player and then take the mean of those player standard deviations. For `prior_tau` we'll use the overall standard deviation of observed PER values for the three seasons (which was calculated in our summary function above). Again, we'll store these values in their own elements for calculations later.
+
+```{r}
+d %>%
+  filter(season != "2022-2023",
+         mp > median(mp)) %>%
+  group_by(player) %>%
+	summarize(per_sd = sd(per),
+	          .groups = "drop") %>%
+  summarize(mean(per_sd, na.rm = TRUE))
+
+
+prior_sd <- 1.57
+prior_var <- prior_sd^2
+prior_precision <- 1 / prior_var
+
+prior_tau <- 4.53
+prior_tau_var <- prior_tau^2
+prior_tau_precision <- 1 / prior_tau_var
+```
+
+
+## Selecting one player
+
+Let's start with one player and work through the three approaches explained above before applying them to the full data set.
+
+We will select a player with a low number of minutes played so that we can see how their PER behaves when we combine it with our prior. I'll select `Thanasis Antetokounmpo` from the 2022-2023 season.
+
+```{r}
+ta <- d %>%
+  filter(season == "2022-2023",
+         player == "Thanasis Antetokounmpo")
+
+ta
+```
+
+
+We don't know Thanasis Antetokounmpo standard deviation of player efficiency rating over the 21 games (91 minutes) he played. Therefore, we don't have a standard deviation for his production.
+
+Let's store his observed values in separate elements.
+
+
+```{r}
+obs_mu <- 1.9
+obs_n <- 91
+```
+
+
+## Method 1
+
+I stumbled upon this method in the 2nd edition of Wayne Winston's fantastic book, Mathletics.
+
+```{r}
+bayes_v1 <- (obs_mu * obs_n + prior_mu * prior_n) / (obs_n + prior_n)
+bayes_v1
+```
+
+Combining the observed PER and sample size (minutes played) for Antetokounmpo with the prior PER and prior sample size for the population, we see that Antetokoumpo's estimated PER gets pulled up closer to the population mean, though still below average.  
+
+To get a sense for how much sample size effects the shrinkage towards the prior, let's pretend that Antetokounmpo had 1200 minutes of observation with the same PER.
+
+```{r}
+(obs_mu * 1200 + prior_mu * prior_n) / (1200 + prior_n)
+```
+
+
+Notice that with 1200 minutes played we are much more certain that Antetokounmpo has a below average PER.
+
+
+## Method 2
+
+Recall that for method 2 to work we require a mean and standard deviation for Antetokounmpo's PER. Since we don't have a standard deviation for his PER in the 2022-2023 we will get his PER from the previous 3 seasons and calculate a standard deviation. We will store that value in its own element.
+
+This approach was discussed in Chapter 9 of Gelman and Hill's Regression and Other Stories.
+
+```{r}
+d %>%
+  filter(season != "2022-2023",
+         player == "Thanasis Antetokounmpo") %>%
+  summarize(sd(per))
+
+obs_sd <- 1.19
+```
+
+
+Applying method 2 we get the following result.
+
+```{r}
+## Posterior
+bayes_v2 <- ((1/prior_sd^2 * prior_mu) + (1 / obs_sd^2 * obs_mu))/((1/obs_sd^2) + (1/prior_sd^2))
+
+bayes_v2
+
+## Posterior SD
+bayes_v2_sd <- sqrt(1/(1/obs_sd^2 + 1/prior_sd^2))
+bayes_v2_sd
+
+## Posterior 95% CI
+bayes_v2 + qnorm(p = c(0.025, 0.975))*bayes_v2_sd
+```
+
+
+We could use a similar approach with just the mean and standard deviation (no sample size info) but use precision (1 / variance) as the parameter describing our spread in the data (instead of SD). We obtain the same results.
+
+
+```{r}
+obs_precision <- 1 / obs_sd^2
+
+posterior_precision <- prior_precision + obs_precision
+
+bayes_v2.2 <- prior_precision/posterior_precision * prior_mu + obs_precision/posterior_precision * obs_mu
+
+bayes_v2.2
+
+bayes_v2.2_sd <- sqrt(1/posterior_precision)
+bayes_v2.2_sd
+
+## Posterior 95% CI
+bayes_v2.2 + qnorm(p = c(0.025, 0.975))*bayes_v2.2_sd
+```
+
+
+This result is much more conservative than method 1. We see that Antetokounmpo is estimated to be well below average. Additionally, now that we have a standard deviation for Antetokounmpo's PER we are also able to calculate a credible interval for his performance.
+
+
+## Method 3
+
+For this final method we will use all of the observed info - mean, sd, and minutes play. This approach was presented in William Bolstad's Introduction to Bayesian Statistics, 2nd Ed.
+
+
+```{r}
+bayes_v3_precision <- prior_precision + obs_n/prior_tau_var
+bayes_v3_precision
+
+bayes_v3_sd <- sqrt(1/bayes_v3_precision)
+bayes_v3_sd
+
+bayes_v3 <- (prior_precision / (obs_n/prior_tau_var + prior_precision))*prior_mu + ((obs_n/prior_tau_var) / (obs_n/prior_tau_var + prior_var)) * obs_mu
+
+bayes_v3
+
+## Posterior 95% CI
+bayes_v3 + qnorm(p = c(0.025, 0.975))*bayes_v3_sd
+```
+
+
+## Comparing the Results
+
+```{r}
+data.frame(bayes_v1, bayes_v2, bayes_v2_sd, bayes_v3, bayes_v3_sd) %>%
+  knitr::kable()
+```
+
+
+
+* Method 1 has the largest pull towards the prior mean because it uses the least information. Since we don't have an observed standard deviation for our observation, we also don't have any information about the variability in the posterior mean.
+* Method 2 has less pull to the prior mean than version 1 and also has a rather large standard deviation around the values.
+* Methods 3 has the lowest pull towards the mean compared to the other three approaches and it uses the largest amount of information.
+
+Antetokounmpo only had 91 minutes of observation time. To show how sample sizes effects our estimate, if we increase his sample size to 1000 we end up with more confidence about his performance (an estimated PER closer to the observed 1.9 and a smaller standard deviation). 
+
+```{r}
+bayes_v3.3_precision <- prior_precision + 1000/prior_tau_var
+bayes_v3.3_precision
+
+bayes_v3.3_sd <- sqrt(1/bayes_v3.3_precision)
+bayes_v3.3_sd
+
+bayes_v3.3 <- (prior_precision / (1000/prior_tau_var + prior_precision))*prior_mu + ((1000/prior_tau_var) / (1000/prior_tau_var + prior_var)) * obs_mu
+
+bayes_v3.3
+
+## Posterior 95% CI
+bayes_v3.3 + qnorm(p = c(0.025, 0.975))*bayes_v3.3_sd
+```
+
+
+Let's create a simulation using `rnorm()` and plot the estimates from the three methods. Since we don't have a standard deviation for method 1 we will use the `prior_sd`. We notice that method 3, which uses the most information gives us a much more conservative belief about the player's true performance compared to the other two methods.
+
+
+```{r}
+N <- 1e4
+
+set.seed(9087)
+v1_sim <- rnorm(n = N, mean = bayes_v1, sd = prior_sd)
+v2_sim <- rnorm(n = N, mean = bayes_v2, sd = bayes_v2_sd)
+v3_sim <- rnorm(n = N, mean = bayes_v3, sd = bayes_v3_sd)
+
+
+plot(density(v1_sim), 
+     col = "blue",
+     lwd = 3,
+     xlim = c(0, 20),
+     ylim = c(0, 0.95),
+     main = "Bayesian Normal Updating -- 3 Approaches\nDashed Line = Observed PER")
+lines(density(v2_sim), 
+     col = "red",
+     lwd = 3)
+lines(density(v3_sim), 
+     col = "green",
+     lwd = 3)
+abline(v = obs_mu,
+       col = "black",
+       lty = 2,
+       lwd = 2)
+legend(x = 12,
+       y = 0.8,
+       c("Method 1", "Method 2", "Method 3"),
+       col = c("blue", "red", "green"),
+       lwd = 2)
+
+```
+
+
+## Wrapping Up
+
+The normal-normal conjugate can be a little tricky compared to a beta-binomial conjugate, but it is an important distribution to work with given most of the data we deal with on a regular basis. Without getting into complex modeling we can use a few simple approaches for a normal-normal conjugate that allows us to quickly update our beliefs based on various bits of information we have access to. Hopefully this article was useful at showing a few of these approaches (there are others!).
